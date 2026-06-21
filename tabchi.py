@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 # 🔐 مقادیر خودت رو اینجا وارد کن
 BOT_TOKEN = "7971831657:AAEMhs1nXILts_r8cS-3ZrcDxq8qjdoVDYc"
-INITIAL_ADMIN_ID = 5698242770  # آیدی عددی خودت
+INITIAL_ADMIN_ID = 1004408484961  # آیدی عددی خودت
 
 # 📁 مسیرها
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
