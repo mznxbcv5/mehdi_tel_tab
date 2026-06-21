@@ -7,6 +7,7 @@ import threading
 import asyncio
 import requests
 import logging
+from datetime import datetime
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError
 from telethon.tl.types import Channel
@@ -22,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 # 🔐 مقادیر خودت رو اینجا وارد کن
 BOT_TOKEN = "8807306409:AAG7rsRNlxnbe1jayn66cKHYsUKVKvvLOR8"
-INITIAL_ADMIN_ID = 5698242770  # آیدی عددی خودت
+INITIAL_ADMIN_ID = 5698242770
 
 # 📁 مسیرها
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
@@ -30,7 +31,6 @@ CONFIG_DIR = os.path.join(BASE_DIR, "config")
 SESSION_DIR = os.path.join(BASE_DIR, "accounts")
 MEDIA_DIR = os.path.join(BASE_DIR, "media")
 
-# ایجاد دایرکتوری‌ها
 for dir_path in [CONFIG_DIR, SESSION_DIR, MEDIA_DIR]:
     os.makedirs(dir_path, exist_ok=True)
 
@@ -39,6 +39,7 @@ ACCOUNTS_INDEX = os.path.join(CONFIG_DIR, "accounts.json")
 ADMINS_FILE = os.path.join(CONFIG_DIR, "admins.json")
 GLOBAL_FILE = os.path.join(CONFIG_DIR, "global.json")
 API_CONFIG_FILE = os.path.join(CONFIG_DIR, "api_config.json")
+STATS_FILE = os.path.join(CONFIG_DIR, "stats.json")
 
 # ==================== فایل‌های پیش‌فرض ====================
 if not os.path.exists(ADMINS_FILE):
@@ -52,19 +53,22 @@ if not os.path.exists(ACCOUNTS_INDEX):
 if not os.path.exists(GLOBAL_FILE):
     with open(GLOBAL_FILE, "w", encoding="utf-8") as f:
         json.dump({
-            "active": False,  # 👈 دیگه پیش‌فرض غیرفعاله
+            "active": False,
             "interval": 60,
-            "banner": {
-                "type": "text",
-                "content": ""  # 👈 خالی خالی
-            }
+            "banner": {"type": "text", "content": ""}
         }, f, ensure_ascii=False, indent=2)
 
 if not os.path.exists(API_CONFIG_FILE):
     with open(API_CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump({"api_id": None, "api_hash": None}, f, ensure_ascii=False, indent=2)
+
+if not os.path.exists(STATS_FILE):
+    with open(STATS_FILE, "w", encoding="utf-8") as f:
         json.dump({
-            "api_id": None,
-            "api_hash": None
+            "total_sent": 0,
+            "last_send": None,
+            "last_send_time": None,
+            "accounts_stats": {}
         }, f, ensure_ascii=False, indent=2)
 
 # ==================== توابع کمکی ====================
@@ -72,11 +76,7 @@ def load_json(path: str, default):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except FileNotFoundError:
-        save_json(path, default)
-        return default
-    except json.JSONDecodeError:
-        logger.error(f"فایل {path} خراب است. ریست شد.")
+    except:
         save_json(path, default)
         return default
 
@@ -109,10 +109,61 @@ def ensure_media_dir(name: str) -> str:
 def now_ts():
     return int(time.time())
 
+def get_persian_time():
+    now = datetime.now()
+    return now.strftime("%Y/%m/%d %H:%M:%S")
+
+# ==================== مدیریت آمار ====================
+class StatsManager:
+    def __init__(self):
+        self.stats_file = STATS_FILE
+        self._load_stats()
+    
+    def _load_stats(self):
+        self.stats = load_json(self.stats_file, {
+            "total_sent": 0,
+            "last_send": None,
+            "last_send_time": None,
+            "accounts_stats": {}
+        })
+    
+    def save(self):
+        save_json(self.stats_file, self.stats)
+    
+    def add_send(self, account_name: str = None):
+        self.stats["total_sent"] = self.stats.get("total_sent", 0) + 1
+        self.stats["last_send"] = get_persian_time()
+        self.stats["last_send_time"] = time.time()
+        
+        if account_name:
+            if account_name not in self.stats["accounts_stats"]:
+                self.stats["accounts_stats"][account_name] = {"sent": 0, "last_send": None}
+            self.stats["accounts_stats"][account_name]["sent"] += 1
+            self.stats["accounts_stats"][account_name]["last_send"] = get_persian_time()
+        
+        self.save()
+    
+    def get_stats(self):
+        stats = self.stats
+        last_send = stats.get("last_send", "هنوز ارسالی نداشته")
+        total = stats.get("total_sent", 0)
+        
+        text = f"📊 **آمار ارسال**\n\n"
+        text += f"📨 کل پیام‌های ارسال شده: **{total}**\n"
+        text += f"🕐 آخرین ارسال: **{last_send}**\n"
+        
+        accounts_stats = stats.get("accounts_stats", {})
+        if accounts_stats:
+            text += "\n📋 **آمار هر اکانت:**\n"
+            for name, data in accounts_stats.items():
+                text += f"• {name}: {data.get('sent', 0)} پیام (آخرین: {data.get('last_send', 'ندارد')})\n"
+        
+        return text
+
+stats_manager = StatsManager()
+
 # ==================== Rate Limiter ====================
 class RateLimiter:
-    """محدود کننده نرخ ارسال برای جلوگیری از بن شدن"""
-    
     def __init__(self, max_per_second=1):
         self.max_per_second = max_per_second
         self.tokens = max_per_second
@@ -137,18 +188,13 @@ class RateLimiter:
 
 # ==================== مدیریت API ====================
 class APIManager:
-    """مدیریت متمرکز API ID و Hash"""
-    
     def __init__(self):
         self.config_file = API_CONFIG_FILE
         self._load_config()
         self.lock = threading.Lock()
     
     def _load_config(self):
-        self.config = load_json(self.config_file, {
-            "api_id": None,
-            "api_hash": None
-        })
+        self.config = load_json(self.config_file, {"api_id": None, "api_hash": None})
     
     def save_config(self):
         with self.lock:
@@ -159,7 +205,6 @@ class APIManager:
             self.config["api_id"] = int(api_id)
             self.config["api_hash"] = str(api_hash).strip()
             self.save_config()
-            logger.info("API ID و Hash با موفقیت ذخیره شدند")
             return True
         except Exception as e:
             logger.error(f"خطا در ذخیره API: {e}")
@@ -177,7 +222,6 @@ class APIManager:
         self.config["api_id"] = None
         self.config["api_hash"] = None
         self.save_config()
-        logger.info("API پاک شد")
 
 # ==================== کلاس تبچی ====================
 class TabchiAccount:
@@ -191,20 +235,15 @@ class TabchiAccount:
         self.loop = loop
         self.config_path = os.path.join(CONFIG_DIR, f"{name}.json")
         self.media_dir = ensure_media_dir(name)
-        self.rate_limiter = RateLimiter(max_per_second=1)  # 👈 محدود کننده
+        self.rate_limiter = RateLimiter(max_per_second=1)
         
-        # بارگذاری تنظیمات - کاملاً خالی
         default_settings = {
-            "active": False,  # 👈 پیش‌فرض غیرفعال
+            "active": False,
             "interval": 30,
-            "banner": {
-                "type": "text",
-                "content": ""  # 👈 خالی
-            }
+            "banner": {"type": "text", "content": ""}
         }
         self.settings = load_json(self.config_path, default_settings)
         
-        # اگه فایل قبلی بود و محتوای پیش‌فرض داشت، پاکش کن
         if self.settings.get("banner", {}).get("content") == "نود رایگان پی":
             self.settings = default_settings
             self.save_settings()
@@ -231,10 +270,8 @@ class TabchiAccount:
             self._task_personal.cancel()
             try:
                 await self._task_personal
-            except asyncio.CancelledError:
+            except:
                 pass
-            except Exception as e:
-                logger.error(f"خطا در توقف اکانت {self.name}: {e}")
         logger.info(f"اکانت {self.name} متوقف شد")
 
     async def _personal_loop(self):
@@ -246,11 +283,12 @@ class TabchiAccount:
                             break
                         if is_group_or_mega(dialog):
                             await self._send_banner(dialog.id)
-                            await asyncio.sleep(2)  # 👈 تأخیر بین ارسال‌ها
+                            await asyncio.sleep(2)
                 
-                # خواب بر اساس تنظیمات (تبدیل به ثانیه)
-                sleep_time = self.settings.get("interval", 30) * 60
-                for _ in range(int(sleep_time / 5)):
+                interval_minutes = self.settings.get("interval", 30)
+                sleep_seconds = interval_minutes * 60
+                
+                for _ in range(int(sleep_seconds / 5)):
                     if not self._running:
                         break
                     await asyncio.sleep(5)
@@ -262,52 +300,48 @@ class TabchiAccount:
                 await asyncio.sleep(10)
 
     async def _send_banner(self, chat_id):
-        """ارسال بنر با محدودیت نرخ"""
         banner = self.settings.get("banner", {"type": "text", "content": ""})
         btype = banner.get("type", "text")
         
-        # اگه محتوا خالی بود، هیچی نفرست
         if btype == "text" and not banner.get("content", "").strip():
             return
         if btype in ("photo", "video") and not banner.get("file_path"):
             return
         
         try:
-            # اعمال محدودیت نرخ
             await self.rate_limiter.wait_if_needed()
             
             if btype == "text":
                 content = banner.get("content", "").strip()
                 if content:
                     await self.client.send_message(chat_id, content)
-                    logger.debug(f"بنر متنی به {chat_id} ارسال شد")
+                    stats_manager.add_send(self.name)
                     
             elif btype == "photo":
                 file_path = banner.get("file_path")
                 caption = banner.get("caption", "")
                 if file_path and os.path.exists(file_path):
                     await self.client.send_file(chat_id, file_path, caption=caption)
-                    logger.debug(f"بنر عکس به {chat_id} ارسال شد")
+                    stats_manager.add_send(self.name)
                     
             elif btype == "video":
                 file_path = banner.get("file_path")
                 caption = banner.get("caption", "")
                 if file_path and os.path.exists(file_path):
                     await self.client.send_file(chat_id, file_path, caption=caption)
-                    logger.debug(f"بنر ویدیو به {chat_id} ارسال شد")
+                    stats_manager.add_send(self.name)
                     
         except Exception as e:
             logger.error(f"خطا در ارسال بنر به {chat_id}: {e}")
 
     async def send_now_to_all(self):
-        """ارسال دستی به همه گروه‌ها"""
         try:
             sent_count = 0
             async for dialog in self.client.iter_dialogs():
                 if is_group_or_mega(dialog):
                     await self._send_banner(dialog.id)
                     sent_count += 1
-                    await asyncio.sleep(2)  # تأخیر بین ارسال‌ها
+                    await asyncio.sleep(2)
             logger.info(f"{self.name}: {sent_count} بنر ارسال شد")
             return True
         except Exception as e:
@@ -322,18 +356,13 @@ class TabchiManager:
         self.pending: Dict[str, TelegramClient] = {}
         self.api_manager = APIManager()
         
-        # بارگذاری تنظیمات عمومی
         default_global = {
             "active": False,
             "interval": 60,
-            "banner": {
-                "type": "text",
-                "content": ""
-            }
+            "banner": {"type": "text", "content": ""}
         }
         self.global_settings = load_json(GLOBAL_FILE, default_global)
         
-        # پاکسازی محتوای پیش‌فرض قدیمی
         if self.global_settings.get("banner", {}).get("content") == "نود رایگان پی":
             self.global_settings = default_global
             save_json(GLOBAL_FILE, self.global_settings)
@@ -348,19 +377,16 @@ class TabchiManager:
         save_json(ACCOUNTS_INDEX, {"accounts": accounts})
 
     async def load_existing(self):
-        """بارگذاری اکانت‌های موجود"""
         idx = self.list_accounts_index()
         api_id, api_hash = self.api_manager.get_api()
         
         for rec in idx:
             name = rec["name"]
             phone = rec["phone"]
-            
             acc_api_id = rec.get("api_id", api_id)
             acc_api_hash = rec.get("api_hash", api_hash)
             
             if not acc_api_id or not acc_api_hash:
-                logger.warning(f"اکانت {name}: اطلاعات API ناقص")
                 continue
                 
             session_path = os.path.join(SESSION_DIR, name)
@@ -374,17 +400,14 @@ class TabchiManager:
                     await acc.start()
                     logger.info(f"اکانت {name} بارگذاری شد")
                 else:
-                    logger.warning(f"اکانت {name}: نیاز به ورود مجدد")
                     await client.disconnect()
             except Exception as e:
-                logger.error(f"خطا در بارگذاری اکانت {name}: {e}")
+                logger.error(f"خطا در بارگذاری {name}: {e}")
         
-        # شروع حلقه عمومی
         if self._task_global is None or self._task_global.done():
             self._task_global = self.loop.create_task(self._global_loop())
 
     async def _global_loop(self):
-        """حلقه ارسال عمومی"""
         while self._running:
             try:
                 if self.global_settings.get("active", False):
@@ -402,8 +425,10 @@ class TabchiManager:
                             except Exception as e:
                                 logger.error(f"خطا در ارسال عمومی با {name}: {e}")
                 
-                sleep_time = self.global_settings.get("interval", 60) * 60
-                for _ in range(int(sleep_time / 5)):
+                interval_minutes = self.global_settings.get("interval", 60)
+                sleep_seconds = interval_minutes * 60
+                
+                for _ in range(int(sleep_seconds / 5)):
                     if not self._running:
                         break
                     await asyncio.sleep(5)
@@ -415,11 +440,9 @@ class TabchiManager:
                 await asyncio.sleep(10)
 
     async def _send_global_banner(self, client: TelegramClient, chat_id):
-        """ارسال بنر عمومی"""
         banner = self.global_settings.get("banner", {"type": "text", "content": ""})
         btype = banner.get("type", "text")
         
-        # اگه محتوا خالی بود، هیچی نفرست
         if btype == "text" and not banner.get("content", "").strip():
             return
         if btype in ("photo", "video") and not banner.get("file_path"):
@@ -430,34 +453,32 @@ class TabchiManager:
                 content = banner.get("content", "").strip()
                 if content:
                     await client.send_message(chat_id, content)
+                    stats_manager.add_send("global")
             elif btype in ("photo", "video"):
                 file_path = banner.get("file_path")
                 caption = banner.get("caption", "")
                 if file_path and os.path.exists(file_path):
                     await client.send_file(chat_id, file_path, caption=caption)
+                    stats_manager.add_send("global")
         except Exception as e:
-            logger.error(f"خطا در ارسال بنر عمومی به {chat_id}: {e}")
+            logger.error(f"خطا در ارسال بنر عمومی: {e}")
 
     async def start_code_request(self, name: str, phone: str):
-        """درخواست کد ورود"""
         api_id, api_hash = self.api_manager.get_api()
         if not api_id or not api_hash:
             return "API_NOT_CONFIGURED"
-        
         try:
             session_path = os.path.join(SESSION_DIR, name)
             client = TelegramClient(session_path, api_id, api_hash)
             await client.connect()
             await client.send_code_request(phone)
             self.pending[name] = client
-            logger.info(f"کد برای {phone} درخواست شد")
             return "OK"
         except Exception as e:
             logger.error(f"خطا در درخواست کد: {e}")
             return "ERROR"
 
     async def finish_sign_in(self, name: str, phone: str, code: str):
-        """تکمیل ورود"""
         api_id, api_hash = self.api_manager.get_api()
         if not api_id or not api_hash:
             return "API_NOT_CONFIGURED"
@@ -480,33 +501,23 @@ class TabchiManager:
             logger.error(f"خطا در ورود: {e}")
             return "ERROR"
         
-        # ساخت اکانت جدید
         acc = TabchiAccount(name, api_id, api_hash, phone, client, self.loop)
         self.accounts[name] = acc
         
-        # ذخیره در ایندکس
         idx = self.list_accounts_index()
-        idx.append({
-            "name": name, 
-            "phone": phone,
-            "api_id": api_id,
-            "api_hash": api_hash
-        })
+        idx.append({"name": name, "phone": phone, "api_id": api_id, "api_hash": api_hash})
         self.save_accounts_index(idx)
         
         if name in self.pending:
             del self.pending[name]
         
         await acc.start()
-        logger.info(f"اکانت {name} با موفقیت اضافه شد")
         return "OK"
 
     async def finish_two_factor(self, name: str, password: str):
-        """ورود دو مرحله‌ای"""
         client = self.pending.get(name)
         if not client:
             return "ERROR"
-        
         try:
             await client.sign_in(password=password)
         except Exception as e:
@@ -526,45 +537,36 @@ class TabchiManager:
             del self.pending[name]
         
         await acc.start()
-        logger.info(f"ورود 2FA برای {name} موفقیت‌آمیز بود")
         return "OK"
 
     async def toggle_active(self, name: str) -> bool:
-        """تغییر وضعیت فعال/غیرفعال"""
         acc = self.accounts.get(name)
         if not acc:
             return False
         acc.settings["active"] = not acc.settings.get("active", False)
         acc.save_settings()
-        status = "فعال" if acc.settings["active"] else "غیرفعال"
-        logger.info(f"اکانت {name} {status} شد")
         return acc.settings["active"]
 
     async def set_interval(self, name: str, minutes: int) -> bool:
-        """تنظیم فاصله ارسال"""
         acc = self.accounts.get(name)
         if not acc:
             return False
-        minutes = max(1, min(1440, int(minutes)))  # بین 1 دقیقه تا 24 ساعت
+        minutes = max(1, min(1440, int(minutes)))
         acc.settings["interval"] = minutes
         acc.save_settings()
-        logger.info(f"تایم {name} روی {minutes} دقیقه تنظیم شد")
         return True
 
     async def reset_account(self, name: str) -> bool:
-        """ریست کامل اکانت"""
         acc = self.accounts.get(name)
         if not acc:
             return False
         
         await acc.stop()
-        
         try:
             await acc.client.disconnect()
         except:
             pass
         
-        # پاک کردن فایل‌ها
         try:
             files_to_remove = [
                 acc.config_path,
@@ -583,53 +585,42 @@ class TabchiManager:
         idx = self.list_accounts_index()
         idx = [r for r in idx if r["name"] != name]
         self.save_accounts_index(idx)
-        
-        logger.info(f"اکانت {name} ریست شد")
         return True
 
     async def manual_send(self, name: str) -> bool:
-        """ارسال دستی"""
         acc = self.accounts.get(name)
         if not acc:
             return False
         return await acc.send_now_to_all()
 
     async def global_toggle(self) -> bool:
-        """تغییر وضعیت عمومی"""
         self.global_settings["active"] = not self.global_settings.get("active", False)
         save_json(GLOBAL_FILE, self.global_settings)
-        status = "فعال" if self.global_settings["active"] else "غیرفعال"
-        logger.info(f"ارسال عمومی {status} شد")
         return self.global_settings["active"]
 
     async def global_set_interval(self, minutes: int) -> bool:
-        """تنظیم تایم عمومی"""
         minutes = max(1, min(1440, int(minutes)))
         self.global_settings["interval"] = minutes
         save_json(GLOBAL_FILE, self.global_settings)
-        logger.info(f"تایم عمومی روی {minutes} دقیقه تنظیم شد")
         return True
 
     def global_set_banner(self, banner: dict):
-        """تنظیم بنر عمومی"""
         self.global_settings["banner"] = banner
         save_json(GLOBAL_FILE, self.global_settings)
 
     async def shutdown(self):
-        """خاموش کردن تمیز"""
         self._running = False
-        
         if self._task_global and not self._task_global.done():
             self._task_global.cancel()
             try:
                 await self._task_global
             except:
                 pass
-        
         for acc in self.accounts.values():
             await acc.stop()
-        
-        logger.info("همه اکانت‌ها متوقف شدند")
+
+# ==================== متغیر گلوبال manager ====================
+manager = None  # 👈 این خط مهمه!
 
 # ==================== بات تلگرام ====================
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -646,6 +637,7 @@ def kb_main():
         InlineKeyboardButton("➕ افزودن تبچی", callback_data="add_account"),
         InlineKeyboardButton("📋 لیست تبچی‌ها", callback_data="list_accounts"),
         InlineKeyboardButton("🧷 بنر عمومی", callback_data="global_menu"),
+        InlineKeyboardButton("📊 آمار ارسال", callback_data="show_stats"),
         InlineKeyboardButton("🔧 تنظیمات API", callback_data="api_settings"),
         InlineKeyboardButton("👥 مدیریت ادمین", callback_data="admins_menu"),
         InlineKeyboardButton("📚 راهنما", callback_data="help_menu"),
@@ -701,27 +693,22 @@ def kb_api_settings(configured: bool):
 
 def kb_code_pad(name: str, current_code: str):
     kb = InlineKeyboardMarkup()
-    # ردیف 1-3
     kb.row(
         InlineKeyboardButton("1", callback_data=f"code:{name}:digit:1"),
         InlineKeyboardButton("2", callback_data=f"code:{name}:digit:2"),
         InlineKeyboardButton("3", callback_data=f"code:{name}:digit:3"),
     )
-    # ردیف 4-6
     kb.row(
         InlineKeyboardButton("4", callback_data=f"code:{name}:digit:4"),
         InlineKeyboardButton("5", callback_data=f"code:{name}:digit:5"),
         InlineKeyboardButton("6", callback_data=f"code:{name}:digit:6"),
     )
-    # ردیف 7-9
     kb.row(
         InlineKeyboardButton("7", callback_data=f"code:{name}:digit:7"),
         InlineKeyboardButton("8", callback_data=f"code:{name}:digit:8"),
         InlineKeyboardButton("9", callback_data=f"code:{name}:digit:9"),
     )
-    # ردیف صفر
     kb.row(InlineKeyboardButton("0", callback_data=f"code:{name}:digit:0"))
-    # ردیف عملیات
     kb.row(
         InlineKeyboardButton("⌫", callback_data=f"code:{name}:backspace"),
         InlineKeyboardButton("❌ پاک", callback_data=f"code:{name}:clear"),
@@ -747,8 +734,14 @@ def kb_admins_menu():
 # ==================== هندلرهای پیام ====================
 @bot.message_handler(func=lambda m: True, content_types=["text", "photo", "video"])
 def on_message(msg: Message):
+    global manager  # 👈 دسترسی به manager
+    
     chat_id = msg.chat.id
     if not is_admin(chat_id):
+        return
+    
+    if manager is None:
+        bot.send_message(chat_id, "❌ ربات در حال راه‌اندازی است، چند ثانیه صبر کن...")
         return
     
     state = admin_states.get(chat_id, {"state": None, "data": {}})
@@ -795,7 +788,6 @@ def on_message(msg: Message):
             admin_states[chat_id] = {"state": None, "data": {}}
             return
         
-        # ساخت نام یکتا
         base_name = sanitize_name(phone.replace("+", ""))
         name = base_name
         idx = 1
@@ -995,9 +987,15 @@ def on_message(msg: Message):
 # ==================== هندلرهای Callback ====================
 @bot.callback_query_handler(func=lambda c: True)
 def on_callback(cq: CallbackQuery):
+    global manager  # 👈 دسترسی به manager
+    
     chat_id = cq.message.chat.id
     if not is_admin(chat_id):
         bot.answer_callback_query(cq.id, "⛔ دسترسی ندارید")
+        return
+    
+    if manager is None:
+        bot.answer_callback_query(cq.id, "❌ ربات در حال راه‌اندازی است...")
         return
 
     data = cq.data or ""
@@ -1012,6 +1010,13 @@ def on_callback(cq: CallbackQuery):
         admin_states[chat_id] = {"state": None, "data": {}}
         bot.edit_message_text("❌ عملیات لغو شد", chat_id, cq.message.message_id)
         bot.send_message(chat_id, "📋 پنل مدیریت:", reply_markup=kb_main())
+        return
+
+    # نمایش آمار
+    if data == "show_stats":
+        bot.answer_callback_query(cq.id)
+        stats_text = stats_manager.get_stats()
+        bot.send_message(chat_id, stats_text, parse_mode="Markdown")
         return
 
     # راهنما
@@ -1031,6 +1036,8 @@ def on_callback(cq: CallbackQuery):
             "   • ارسال دستی\n\n"
             "4️⃣ **بنر عمومی**\n"
             "   • یه بنر مشترک برای همه\n\n"
+            "5️⃣ **آمار**\n"
+            "   • نمایش تعداد ارسال‌ها و زمان آخرین ارسال\n\n"
             "⚠️ **نکات مهم**\n"
             "• فقط به گروه‌ها ارسال میشه\n"
             "• برای جلوگیری از بن، با تأخیر ارسال میشه"
@@ -1260,7 +1267,6 @@ def on_callback(cq: CallbackQuery):
             try:
                 if future.result(timeout=20):
                     bot.send_message(chat_id, f"🗑 اکانت {name} حذف شد")
-                    # برگشت به لیست
                     names = list(manager.accounts.keys())
                     if names:
                         bot.send_message(chat_id, "👥 لیست تبچی‌ها:", reply_markup=kb_account_list(names))
@@ -1289,7 +1295,7 @@ def on_callback(cq: CallbackQuery):
         
         if action == "digit":
             digit = parts[3]
-            if len(current_code) < 6:  # محدودیت طول کد
+            if len(current_code) < 6:
                 current_code += digit
                 admin_states[chat_id]["data"]["code"] = current_code
                 
@@ -1337,7 +1343,6 @@ def on_callback(cq: CallbackQuery):
                 bot.send_message(chat_id, "📋 پنل مدیریت:", reply_markup=kb_main())
             return
         
-        # به‌روزرسانی نمایش
         bot.edit_message_text(
             f"🔐 کد رو وارد کن:\nاکانت: {name}\nکد: {current_code}",
             chat_id,
@@ -1408,7 +1413,6 @@ def process_remove_admin(msg):
 
 # ==================== اجرای بات ====================
 def run_bot():
-    """اجرای بات در یک نخ جدا"""
     bot.remove_webhook()
     retry_count = 0
     max_retries = 10
@@ -1430,6 +1434,7 @@ def run_bot():
     
     logger.error("بات متوقف شد (بیش از حد تلاش)")
 
+# ==================== اجرای اصلی ====================
 if __name__ == "__main__":
     print("=" * 50)
     print("🚀 ربات تبچی در حال اجرا...")
@@ -1440,7 +1445,7 @@ if __name__ == "__main__":
     asyncio.set_event_loop(loop)
     
     # ساخت manager
-    manager = TabchiManager(loop)
+    manager = TabchiManager(loop)  # 👈 اینجا manager ساخته میشه
     
     # بارگذاری اکانت‌ها
     try:
@@ -1459,7 +1464,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("خاموش شدن...")
     finally:
-        # خاموش کردن تمیز
         loop.run_until_complete(manager.shutdown())
         loop.close()
         logger.info("ربات خاموش شد")
